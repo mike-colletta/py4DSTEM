@@ -1,0 +1,20 @@
+For installing jupyter python extensions
+
+1. Install the python package
+# If conda:
+conda install -c conda-forge jupyter_contrib_nbextensions
+# or with pip:
+pip install jupyter_contrib_nbextensions
+
+2. Install javascript and css files
+jupyter contrib nbextension install --user
+
+3. Install Configuration interface
+conda install -c conda-forge jupyter_nbextensions_configurator
+
+Now restart Notebook. There should be a tab to the right of "IPython Clusters"
+labeled "Nbextensions". Sort through the extensions and check off the ones you would like.
+Highlighting an extension should reveal a tutorial or description as well as a set of
+customizable parameters below the checklist.
+
+The extensions used to create General.html were Collapsible Headings and Table of Contents (2)
