@@ -1,9 +1,9 @@
 # Functions for obtaining vacuum probe templates.
 #
-# Probe templates can be generated from vacuum scans, from a selected ROI of a vacuum region of a 
-# scan, or synthetic probes.  Ultimately the purpose is to generate a kernel for convolution with 
-# individual diffraction patterns to identify Bragg disks.  Kernel generation will generally proceed 
-# in two steps, which will each correspond to a function call: first, obtaining  or creating the 
+# Probe templates can be generated from vacuum scans, from a selected ROI of a vacuum region of a
+# scan, or synthetic probes.  Ultimately the purpose is to generate a kernel for convolution with
+# individual diffraction patterns to identify Bragg disks.  Kernel generation will generally proceed
+# in two steps, which will each correspond to a function call: first, obtaining  or creating the
 # diffraction pattern of a probe over vacuum, and second, turning the probe DP into a convolution
 # kernel by shifting and normalizing.
 
@@ -89,6 +89,8 @@ def get_probe_from_4Dscan_ROI(datacube, ROI, mask_threshold=0.2,
     probe = datacube.data[xy[0,0],xy[1,0],:,:]
     for n in tqdmnd(range(1,length)):
         curr_DP = datacube.data[xy[0,n],xy[1,n],:,:] * DP_mask
+        if verbose:
+            print("Shifting and averaging diffraction pattern {} of {}.".format(n,datacube.R_N))
 
         xshift,yshift = get_shift(probe, curr_DP)
         curr_DP_shifted = get_shifted_ar(curr_DP, xshift, yshift)
@@ -291,11 +293,3 @@ def get_probe_kernel_logistictrench(probe, radius, trenchwidth, blurwidth):
     probe_kernel = get_shifted_ar(probe_kernel, -xCoM, -yCoM)
 
     return probe_kernel
-
-
-
-
-
-
-
-
