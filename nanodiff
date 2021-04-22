@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Jan  9 17:43:38 2021
+
+@author: dandan
+"""
+
+## Import all necessary modules. Might be neccessary to edit depending on file path
+
+import py4DSTEM
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.patches import Circle, Ellipse
+from matplotlib import gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.ndimage.filters import gaussian_filter
+from scipy.signal import medfilt
+from scipy.ndimage import sobel
+from scipy.optimize import curve_fit
+from scipy.special import factorial
+from scipy.stats import poisson
+
+from py4DSTEM.process.KEM.orientation import *
+from py4DSTEM.process.diskdetection import *
+from py4DSTEM.process.utils import get_CoM,radial_integral, get_maxima_1D,tqdmnd
+from py4DSTEM.process.calibration import *
+from py4DSTEM.process.latticevectors import *
+from py4DSTEM.process.fit import fit_2D
+from py4DSTEM.process import KEM
+from py4DSTEM.process.utils.ellipticalCoords import *
+
+from py4DSTEM.file.datastructure import DiffractionSlice, RealSlice
+from py4DSTEM.file.io import  read
+from py4DSTEM.file.io.native import save, append
+
+from os import listdir
+from matplotlib.gridspec import GridSpec
+# Import by personal display preference 
+import matplotlib
+
+
+from PAD import *
+from EM import *
+
+def get_adf_new(self,inner,outer):
+    self.get_cbedsum()
+    if not hasattr(self, 'cbedrad'):
+        self.get_center()
+    self.adf_new = np.zeros((self.scanx, self.scany))
+    xgrid, ygrid = np.meshgrid(range(self.cbedx), range(self.cbedy))
+    xgrid = xgrid-self.cbedcenterx
+    ygrid = ygrid-self.cbedcentery
+    rad = np.transpose(np.sqrt(ygrid**2+xgrid**2))
+    mask = (rad >= inner) * (rad < outer)
+    for i in range(self.scanx):
+        for j in range(self.scany):
+            self.adf_new[i,j] = np.sum(self.data[:,:,i,j][mask])
+    self.adfinner = inner
+    self.adfouter = outer
+    return
+
+def flip(data):
+    data = np.flip(data,axis = 1)
+    data = np.rot90(data)
+
+    return data
+
+
+def get_adf_high(self,inner,outer):
+    self.get_cbedsum()
+    if not hasattr(self, 'cbedrad'):
+        self.get_center()
+    self.adf_high = np.zeros((self.scanx, self.scany))
+    xgrid, ygrid = np.meshgrid(range(self.cbedx), range(self.cbedy))
+    xgrid = xgrid-self.cbedcenterx
+    ygrid = ygrid-self.cbedcentery
+    rad = np.transpose(np.sqrt(ygrid**2+xgrid**2))
+    mask = (rad >= inner) * (rad < outer)
+    for i in range(self.scanx):
+        for j in range(self.scany):
+            self.adf_high[i,j] = np.sum(self.data[:,:,i,j][mask])
+    self.adfinner = inner
+    self.adfouter = outer
+    return
+
+def bragghist(braggpeaks,ax,minRelativeIntensity=0,relativeToPeak=0):
+    Rar=[]
+    for (i, j) in tqdmnd(braggpeaks.shape[0],braggpeaks.shape[1]):
+        if len(braggpeaks.get_pointlist(i,j).data['qx'])>1:
+            pointlist = braggpeaks.get_pointlist(i,j)
+            qx = pointlist.data['qx']-pointlist.data['qx'][0]
+            qy = pointlist.data['qy']-pointlist.data['qy'][0]
+            r = np.sqrt(qx**2 + qy**2)
+            I = pointlist.data['intensity']
+            mask = I > I[relativeToPeak]*minRelativeIntensity
+            r = r[np.nonzero(r*mask)]
+            Rar = np.append(Rar,r)
+    n, bin_edges, patches = ax.hist(Rar, bins=50)     
+    return n,bin_edges,patches
+
+def bragghist2(braggpeaks,rang,minRelativeIntensity=0,relativeToPeak=0):
+    Rar=[]
+    for (i, j) in tqdmnd(braggpeaks.shape[0],braggpeaks.shape[1]):
+        if len(braggpeaks.get_pointlist(i,j).data['qx'])>1:
+            pointlist = braggpeaks.get_pointlist(i,j)
+            qx = pointlist.data['qx']-pointlist.data['qx'][0]
+            qy = pointlist.data['qy']-pointlist.data['qy'][0]
+            r = np.sqrt(qx**2 + qy**2)
+            I = pointlist.data['intensity']
+            mask = I > I[relativeToPeak]*minRelativeIntensity
+            r = r[np.nonzero(r*mask)]
+            Rar = np.append(Rar,r)
+    n, bin_edges = np.histogram(Rar,range = rang, bins=50)     
+    return n,bin_edges
+
+def crystalinebvm(braggpeaks,rin0,rout0,rin1,rout1,rin2,rout2,rin3,rout3,Q_Nx,Q_Ny,mindetections=1,minRelativeIntensity=0,relativeToPeak=0):
+    detectionmap = np.zeros(braggpeaks.shape)
+    detectionmap1 = np.zeros(braggpeaks.shape)
+    detectionmap2 = np.zeros(braggpeaks.shape)
+    detectionmap3 = np.zeros(braggpeaks.shape)
+    virtualim = np.zeros(braggpeaks.shape)
+    bvm = np.zeros((Q_Nx,Q_Ny))
+    for (i, j) in tqdmnd(braggpeaks.shape[0],braggpeaks.shape[1]):
+        if len(braggpeaks.get_pointlist(i,j).data['qx'])>1:
+            pointlist = braggpeaks.get_pointlist(i,j)
+            qx = pointlist.data['qx']
+            qy = pointlist.data['qy']
+            r = np.sqrt((qx-qx[0])**2 + (qy-qy[0])**2)
+            I = pointlist.data['intensity']    
+            Imask = I > I[relativeToPeak]*minRelativeIntensity
+            rmask = (r>rin0) * (r<rout0)
+            r1mask = (r>rin1) * (r<rout1)
+            r2mask = (r>rin2) * (r<rout2)
+            r3mask = (r>rin3) * (r<rout3)
+            r0 = r[np.nonzero(r*Imask*rmask)]
+            r1 = r[np.nonzero(r*Imask*r1mask)]
+            r2 = r[np.nonzero(r*Imask*r2mask)]
+            r3 = r[np.nonzero(r*Imask*r3mask)]
+            if len(r1)>mindetections-1:
+                detectionmap1[i,j] = True
+            if len(r2)>mindetections-1:
+                detectionmap2[i,j] = True
+            if len(r3)>mindetections-1:
+                detectionmap3[i,j] = True
+            if len(r0)>mindetections-1:
+                detectionmap[i,j] = True
+                x = qx[np.nonzero(qx*Imask*rmask)]
+                y = qy[np.nonzero(qy*Imask*rmask)]
+                n = I[np.nonzero(I*Imask*rmask)]
+                virtualim[i,j] = np.sum(n)
+                for i in range(len(r0)):
+                    bvm = add_to_2D_array_from_floats(bvm,x[i],y[i],n[i])
+
+    return detectionmap,detectionmap1,detectionmap2,detectionmap3,bvm,virtualim
+
+from scipy.spatial import distance
+
+def clusterspacing(detectionmap):
+    coords = np.argwhere(detectionmap)
+    distmat= distance.cdist(coords, coords, 'euclidean')
+    dhist = np.zeros(distmat.shape[0])
+    for i in range(distmat.shape[0]):
+        dvec = distmat[i]
+        # remove zeros and ones from each row
+        x = np.argwhere(dvec<np.sqrt(2))
+        dvec = np.delete(dvec,x,None)
+        dhist[i] = dvec.min()
+    n, bin_edges, patches = plt.hist(dhist, bins=distmat.shape[0]//6)   
+    return dhist
+
+
+def addmaps(dmap,dmap1,dmap2):
+    totalmap = np.zeros_like(dmap)
+    for  i in range(0,dmap.shape[0]):
+        for j in range(0,dmap.shape[1]):
+            l = 4*dmap[i,j] + 2*dmap1[i,j] + dmap2[i,j]
+            totalmap[i,j] = l
+    return totalmap
+
+def find_neighbors(i,j,arx,ary):
+    if i == 0:
+        if j == 0: 
+            neighbors = np.array(([0,1],[1,1],[1,0]))
+        elif j == (ary-1):
+            neighbors = np.array(([1,j],[1,j-1],[0,j-1]))
+        else:
+            neighbors = np.array(([0,j+1],[1,j+1],[1,j],[1,j-1],[0,j-1]))
+    elif i == (arx - 1):
+        if j == 0:
+            neighbors = np.array(([i-1,0],[i-1,1],[i,1]))
+        elif j == (ary - 1):
+            neighbors = np.array(([i-1,j-1],[i-1,j],[i,j-1]))
+        else:
+            neighbors = np.array(([i-1,j-1],[i-1,j],[i-1,j+1],[i,j+1],[i,j-1]))
+    elif j == 0:
+        neighbors = np.array(([i-1,j],[i-1,j+1],[i,j+1],[i+1,j+1],[i+1,j+1],[i+1,j]))
+    elif j == (ary - 1):
+        neighbors = np.array(([i-1,j-1],[i-1,j],[i+1,j],[i+1,j-1],[i,j-1]))
+    else:
+        neighbors = np.array(([i-1,j-1],[i-1,j],[i-1,j+1],[i,j+1],[i+1,j+1],[i+1,j],[i+1,j-1],[i,j-1]))
+    
+    return neighbors
+            
+    
+def same_domain(domain_array,angle,i,j,m,n):
+    if domain_array[m][n] == 0:
+        return False
+    if angle[i][j] > np.pi:
+            angle[i][j] = angle[i][j] - np.pi
+            
+    if angle[m][n] > np.pi:
+        angle[m][n] = angle[m][n] - np.pi
+        
+    diff = np.abs(angle[i][j]-angle[m][n])
+    if diff < 0.18:
+        return True
+    else:
+        return False
+    
+def domain_size(domain_array,maxdomain):
+    size_array = np.zeros(maxdomain)
+    for i in range (0,maxdomain):
+        counter = 0
+        for m in range (0,domain_array.shape[0]):
+            for n in range (0,domain_array.shape[1]):
+                if domain_array[m,n] == i:
+                    counter += 1
+            
+            
+        size_array[i] = counter
+    return size_array
+    
+
+def collape_domains(domain_array,angle):
+    lenx = domain_array.shape[0]
+    leny = domain_array.shape[1]
+    
+    boo = False
+    
+    for i in range(0,lenx):
+        for j in range (0,leny):
+            neighbors = find_neighbors(i,j,lenx,leny)
+            
+            if angle[i][j] == 0:
+                continue
+            
+            for k in range (0,len(neighbors)):
+                if same_domain(domain_array,angle,i,j,neighbors[k][0],neighbors[k][1]) and (domain_array[i][j] > domain_array[neighbors[k][0],neighbors[k][1]]):
+                    domain_array[i][j] = domain_array[neighbors[k][0],neighbors[k][1]]
+                    boo = True
+                              
+    return domain_array, boo 
+    
+
+def zero_domain(domain_array,size_array,cutoff):
+    lenx = domain_array.shape[0]
+    leny = domain_array.shape[1]
+    
+    for i in range (0,lenx):
+        for j in range (0,leny):
+            if domain_array[i][j] != 0:
+                size = size_array[int(domain_array[i][j])]
+                if size < cutoff:
+                    domain_array[i][j] = 0
+    return domain_array
+
+def print_domain(domain_array,angle,domainid):
+    lenx = domain_array.shape[0]
+    leny = domain_array.shape[1]
+    
+    for i in range (0,lenx):
+        for j in range (0,leny):
+            if int(domain_array[i][j]) == domainid:
+                print(i,j,angle[i,j])
+    print('done')
+
+            
+fpv = "/Users/dandan/Documents/data/201009/50_vprobe_p4mrad_4p1cl/scan_x64_y64.raw"
+xmin,xmax=33,43
+ymin,ymax=39,49
+
+dcv,_ = py4DSTEM.file.io.read(fpv, ft='empad')
+
+dcv = py4DSTEM.process.preprocess.crop_data_diffraction(dcv,4,dcv.Q_Nx-4,4,dcv.Q_Ny-4)
+
+
+
+# Run this cell to find ROI over vacuum space
+
+
+
+
+ROI = np.zeros_like(dcv.data[:,:,0,0],dtype=bool)
+ROI[xmin:xmax,ymin:ymax] = True
+
+ave_im = np.average(dcv.data,axis=(2,3))
+roi_rect = Rectangle(xy=(ymin-0.5,xmin-0.5),width=ymax-ymin,height=xmax-xmin,fill=False,color='r')
+
+fig,ax=plt.subplots(figsize=(4,4))
+ax.matshow(ave_im,cmap='gray')
+ax.add_patch(roi_rect)
+plt.show()
+
+
+## Get average probe
+mask_threshold = 0.0005 # min threshold relative to probe peak
+mask_expansion = 20 # iterations of scipy.ndimage.morphology.binary_dilation (# of pixels to expand mask by)
+mask_opening = 1   # iterations of scipy.ndimage.morphology.binary_opening
+verbose = False
+
+
+# Vacuum ROI
+probe = get_probe_from_4Dscan_ROI(dcv, ROI=ROI,
+                                       mask_threshold=mask_threshold,
+                                       mask_expansion=mask_expansion,
+                                       mask_opening=mask_opening,
+                                       verbose=verbose)
+
+# Find CoM pixel of probe
+xCoM_init,yCoM_init = get_CoM(probe)
+
+## Generate vacuum probe kernel
+
+# Gaussian subtraction
+sigma_probe_scale = 2
+probe_kernel = get_probe_kernel_subtrgaussian(probe, sigma_probe_scale=sigma_probe_scale)
+
+# Display probe kernel and line profile
+rad=10
+lineprofile_length=60
+lineprofile_width=2
+
+xCom,yCoM = np.unravel_index(np.argmax(probe_kernel),(dcv.Q_Nx,dcv.Q_Ny))
+line_profile_left = np.sum(probe_kernel[-lineprofile_length:,:lineprofile_width],axis=(1))
+line_profile_right = np.sum(probe_kernel[:lineprofile_length,:lineprofile_width],axis=(1))
+line_profile = np.concatenate([line_profile_left,line_profile_right])
+
+fig,((ax1,ax3),(ax2,ax4))=plt.subplots(2,2,figsize=(8,4))
+ax1.matshow(probe_kernel,cmap = 'gray')
+ax2.matshow(probe_kernel[:rad,:rad],cmap = 'gray')
+ax3.plot(np.arange(len(line_profile)),line_profile)
+ax4.plot(np.arange(len(line_profile)),line_profile)
+ax4.set_ylim(-0.0005,0.0005)
+plt.show()
+
+#fp = '/Users/dandan/Documents/data/201113/PAD/2p4cl_p9mrad/36_nd_2p4cl_180mono_225p4_16ms_64_p9mrad/scan_x64_y64.raw'
+fp = '/Users/dandan/Documents/data/201009/06_nanodiff_225kx_p4_16ms_65mono_4p1cl_p4mrad/scan_x64_y64.raw'
+f = 'f'
+
+
+dca,_ = py4DSTEM.file.io.read(fp, ft='empad')
+dca = py4DSTEM.process.preprocess.crop_data_diffraction(dca,4,dca.Q_Nx-4,4,dca.Q_Ny-4)
+#dca = py4DSTEM.process.preprocess.crop_data_real(dca,0,dca.R_Nx-2,0,dca.R_Ny-1)
+pad = PAD.PADdata(fp)
+
+
+pad.threshold_dark()
+
+
+r_inner_3,r_outer_3 = 0,128
+r_inner,r_outer = 0,128
+r_inner_1,r_outer_1= 32,40
+
+rx = dca.R_Nx
+ry =dca.R_Ny
+kx = dca.Q_Nx
+ky = dca.R_Ny
+
+
+
+# Check real space and diffraction space image
+fig = plt.figure(constrained_layout=True)
+
+gs = GridSpec(3, 4, figure=fig)
+ax1 = fig.add_subplot(gs[0,0])
+ax2 = fig.add_subplot(gs[0,1])
+ax3 = fig.add_subplot(gs[0,2])
+ax4 = fig.add_subplot(gs[0,3])
+ax5 = fig.add_subplot(gs[1,0])
+ax6 = fig.add_subplot(gs[1,1])
+ax7 = fig.add_subplot(gs[1,2])
+ax8 = fig.add_subplot(gs[1,3])
+ax9 = fig.add_subplot(gs[2, :])
+
+fig.suptitle(f)   
+plt.show()
+
+ax1.set_yticks([])
+ax1.set_xticks([])
+x,y=dca.data.shape[2],dca.data.shape[3]
+
+
+x0,y0 = get_CoM(np.sum(dca.data,axis=(0,1)))
+ax2.matshow(np.log(np.sum(dca.data,axis=(0,1))+1),cmap = 'gray') # Diffraction plane
+ax2.set_yticks([])
+ax2.set_xticks([])
+
+corrPower = 0.8      # 1 == cross correaltion, 0 == phase correlation, with intermediate values giving various hybrids.
+sigma = 1         # STD of gaussian smoothin applied to CC 
+edgeBoundary = 0  # Min distance from DP edge
+maxNumPeaks = 50   # Max peaks to return
+minPeakSpacing = 0 # Min spacing between peaks
+#minRelativeIntensity1 = .0035
+minRelativeIntensity1 = .0013
+
+relativeToPeak = 0
+subpixel = 'poly' #'none' # switch to 'multicorr' for better accuracy, in which case need to add upsample_factor param
+
+
+braggpeaks_uncorrected1 = find_Bragg_disks(dca, probe_kernel, 
+                              corrPower=corrPower,
+                              sigma=sigma,
+                              edgeBoundary=edgeBoundary,
+                              minRelativeIntensity=minRelativeIntensity1,
+                              minPeakSpacing=minPeakSpacing,
+                              maxNumPeaks=maxNumPeaks,
+                              subpixel=subpixel)
+
+minRelativeIntensity = 0   # min relative intenstity to mask
+relativeToPeak = 0         # select which peak to measure relative intenstity 
+
+# show histogram of Bragg disk distance from center peak
+n,bins,patches = bragghist(braggpeaks_uncorrected1, ax9, minRelativeIntensity = minRelativeIntensity,
+                                    relativeToPeak = relativeToPeak)
+
+
+patchesbin_max = np.where(n == n.max())
+loc = bins[patchesbin_max][0]
+r_inner_1,r_outer_1 = loc-5,loc+5
+
+n2,bins2 = bragghist2(braggpeaks_uncorrected1, (loc+5,120), minRelativeIntensity = minRelativeIntensity,
+                                    relativeToPeak = relativeToPeak)
+
+patchesbin_max2 = np.where(n2 == n2.max())
+loc2 = bins2[patchesbin_max2][0]
+r_inner_2,r_outer_2 = loc2-5,loc2+5
+
+
+get_adf_new(pad,r_inner_2,r_outer_2)
+adf = flip(pad.adf_new)
+
+ax1.matshow(adf,cmap = 'gray') # Real space
+
+ax9.axvline(r_inner,color='r',linestyle='--')
+ax9.axvline(r_outer,color='r',linestyle='--')
+ax9.axvline(r_inner_1,color='b',linestyle='--')
+ax9.axvline(r_outer_1,color='b',linestyle='--')
+ax9.axvline(r_inner_2,color='g',linestyle='--')
+ax9.axvline(r_outer_2,color='g',linestyle='--')
+#ax9.axvline(r_inner_3,color='r',linestyle='--')
+#ax9.axvline(r_outer_3,color='r',linestyle='--')
+ax9.set_title('Bragg disk Spacing')
+ax9.set_xlabel('Pixel distance')
+ax9.set_ylabel('Occurences')
+
+## Create detection map, BVM, and virtual image given the annulus radius
+dmap,dmap1,dmap2,dmap3,bvm,cim = crystalinebvm(braggpeaks_uncorrected1,r_inner,r_outer, r_inner_1,r_outer_1,r_inner_2,r_outer_2,r_inner_3,r_outer_3,dca.Q_Nx,dca.Q_Ny, 1,
+                                             minRelativeIntensity = minRelativeIntensity,
+                                             relativeToPeak = relativeToPeak)
+"""dmap1,bvm1,cim1 = crystalinebvm(braggpeaks_uncorrected1,r_inner_1,r_outer_1, dca.Q_Nx,dca.Q_Ny, 1,
+                                             minRelativeIntensity = minRelativeIntensity,
+                                             relativeToPeak = relativeToPeak)
+dmap2,bvm2,cim2 = crystalinebvm(braggpeaks_uncorrected1,r_inner_2,r_outer_2, dca.Q_Nx,dca.Q_Ny, 1,
+                                             minRelativeIntensity = minRelativeIntensity,
+                                             relativeToPeak = relativeToPeak)"""
+# Show virtual image and annulus limited BVM
+ax3.matshow(cim,cmap = 'gray')
+ax3.set_xticks([])
+ax3.set_yticks([])
+ax3.set_title('Virtual Image')
+ax4.matshow(bvm**0.25,cmap='jet')
+circle_inner_1 = Circle((y0,x0),radius=r_inner_1, fill=False, edgecolor='b', linestyle="-")
+circle_outer_1 = Circle((y0,x0),radius=r_outer_1, fill=False, edgecolor='b', linestyle="-")
+circle_inner_2 = Circle((y0,x0),radius=r_inner_2, fill=False, edgecolor='g', linestyle="-")
+circle_outer_2 = Circle((y0,x0),radius=r_outer_2, fill=False, edgecolor='g', linestyle="-")
+circle_inner_3 = Circle((y0,x0),radius=r_inner_3, fill=False, edgecolor='orange', linestyle="-")
+circle_outer_3 = Circle((y0,x0),radius=r_outer_3, fill=False, edgecolor='orange', linestyle="-")
+ax4.add_patch(circle_inner_1)
+ax4.add_patch(circle_outer_1)
+ax4.add_patch(circle_inner_2)
+ax4.add_patch(circle_outer_2)
+ax4.add_patch(circle_inner_3)
+ax4.add_patch(circle_outer_3)
+ax4.set_title('BVM')
+ax4.set_xticks([])
+ax4.set_yticks([])
+
+
+# Show detection map and histogram of crystalline spacing
+reds = ['white','red']
+redmap = matplotlib.colors.ListedColormap(reds)
+bounds = [-0.5,0.5,1.5]
+norm = matplotlib.colors.BoundaryNorm(bounds, redmap.N)
+a5 = ax5.imshow(dmap,cmap = redmap,norm = norm)
+blues = ['white','blue']
+bluemap = matplotlib.colors.ListedColormap(blues)
+a6 = ax6.imshow(dmap1,cmap = bluemap,norm = norm)
+greens = ['white','green']
+greenmap = matplotlib.colors.ListedColormap(greens)
+a7 = ax7.imshow(dmap2,cmap = greenmap,norm = norm)
+oranges = ['white','orange']
+orangemap = matplotlib.colors.ListedColormap(oranges)
+totalmap = addmaps(dmap3,dmap1,dmap2)
+colors = ['white','lime','royalblue','teal','red','green','blue','maroon']
+cmap = matplotlib.colors.ListedColormap(colors)
+bounds8 = [-0.5,0.5,1.5, 2.5, 3.5,4.5,5.5,6.5, 7.5]
+norm8 = matplotlib.colors.BoundaryNorm(bounds8, cmap.N)
+a8 = ax8.imshow(totalmap,cmap = cmap,norm = norm8)
+
+ax5.set_xticks([])
+ax5.set_yticks([])
+ax6.set_yticks([])
+
+ax6.set_xticks([])
+ax7.set_yticks([])
+ax7.set_xticks([])
+ax8.set_yticks([])
+ax8.set_xticks([])
+
+ax5.set_title('Crystalline Peak Detection')
+
+plt.show()
+
+
+
+angle,intensity = get_orientation_array(braggpeaks_uncorrected1,x0,y0,r_inner_1,r_outer_1,log=True)
+im = get_orientation_map(angle,intensity,plot = False)
+image = im[0]*im[1]
+
+maxdomain = 1
+        
+lenx = angle.shape[0]
+leny = angle.shape[1]
+
+domain_array = np.zeros((lenx,leny))
+
+for i in range (0,lenx):
+    for j in range (0,leny):
+        neighbors = find_neighbors(i,j,lenx,leny)
+        
+        if angle[i][j] == 0:
+            continue
+        
+        for k in range (0,len(neighbors)):
+            if same_domain(domain_array,angle,i,j,neighbors[k][0],neighbors[k][1]):
+                domain_array[i][j] = domain_array[neighbors[k][0],neighbors[k][1]]
+                break
+        
+        if domain_array[i][j] == 0:
+            domain_array[i][j] = maxdomain
+            maxdomain += 1
+boo = True
+print(domain_array)
+while boo == True:
+    print('a')
+    domain_array, boo = collape_domains(domain_array,angle)
+        
+size_array = domain_size(domain_array,maxdomain)       
+domain_array = zero_domain(domain_array,size_array,4)
+        
+
+intensity1 = np.copy(intensity)
+lenx = domain_array.shape[0]
+leny = domain_array.shape[1]
+    
+for i in range (0,lenx):
+    for j in range (0,leny):
+        if domain_array[i][j] == 0:
+            intensity1[i][j] = 0
+            
+
+im1 = get_orientation_map(angle,intensity1,plot = False)
+image1= im1[0]*im1[1]
+    
+import PySimpleGUI as sg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+import numpy.ma as ma
+
+size_scale_factor = 1000
+r_inner = r_inner_1
+r_outer = r_outer_1
+
+
+ar = (dca.data[5,5,:,:])
+yy,xx = np.meshgrid(np.arange(ar.shape[1]),np.arange(ar.shape[0]))
+rr = np.sqrt((xx-x0)**2 + (yy-y0)**2)
+d = ma.masked_where(rr<=9,ar)
+
+fig = matplotlib.figure.Figure(figsize=(15, 8), dpi=100)
+a1 = fig.add_subplot(132)
+a1.matshow(image1)
+a2 = fig.add_subplot(133)
+a2.matshow(d,cmap = 'gray')
+#a1.plot(5,5,marker = '+',color = 'r',markersize = 25)
+a3 = fig.add_subplot(131)
+cmap = mpl.cm.prism
+cmap.set_under('black')
+norm = mpl.colors.Normalize(vmin=0.5, vmax=maxdomain+0.5)
+
+a3.matshow(domain_array,cmap = cmap,norm = norm)
+
+#a3.plot(5,5,marker = '+',color = 'r',markersize = 25)
+
+p0 = braggpeaks_uncorrected1.get_pointlist(5,5).data
+a2.scatter(p0['qy'][1:],p0['qx'][1:],color='r',s=size_scale_factor*p0['intensity'][1:]/np.max(p0['intensity']))
+
+cir1 = Circle((y0,x0),radius=r_inner, fill=False, edgecolor='r', linestyle="-")
+cir2 = Circle((y0,x0),radius=r_outer, fill=False, edgecolor='r', linestyle="-")
+a2.add_patch(cir1)
+a2.add_patch(cir2)
+
+
+#fig,axs=plt.subplots(1,2,figsize=(15,8))
+#axs[0].matshow(dmap2)
+#axs[1].matshow((np.log(dca.data[5,5,:,:])),cmap = 'jet')
+
+#fig, axs = plt.subplots(1,2)
+#axs[0].plot([1,2],[3,4])
+#axs[1].plot([0,1],[2,3])
+                                      
+def draw_figure(canvas, figure):
+    figure_canvas_agg = FigureCanvasTkAgg(figure, canvas)
+    figure_canvas_agg.draw()
+    figure_canvas_agg.get_tk_widget().pack(side="top", fill="both", expand=1)
+    return figure_canvas_agg
+
+# Define the window layout
+layout = [
+    [sg.Canvas(key="-CANVAS-")],
+    [#sg.T('0',key='x'),  
+     sg.Slider(range=(0,dmap2.shape[0]-1),
+     enable_events=True,
+     size=(60,15),
+     orientation='horizontal',
+     font=('Helvetica', 12),
+     key = 'slider_x',
+     default_value = 5)],
+    [#sg.T('0',key='y'),
+     sg.Slider(range=(0,dmap2.shape[1]-1),
+     enable_events=True,
+     size=(60,15),
+     orientation='horizontal',
+     font=('Helvetica', 12),
+     key = 'slider_y',
+     default_value = 5)],
+]
+
+# Create the form and show it without the plot
+window = sg.Window(
+    "CBED Pattern",
+    layout,
+    location=(0, 0),
+    finalize=True,
+    element_justification="center",
+    font="Helvetica 18",
+)
+
+# Add the plot to the window
+canvas = window["-CANVAS-"].TKCanvas
+f = draw_figure(canvas, fig)
+
+def delete_figure_agg(figure_agg):
+    figure_agg.get_tk_widget().forget()
+    plt.close('all')
+
+while True:             # Event Loop  
+    event, values = window.read() 
+    if values != None:
+        x = int(values['slider_x'])
+        y = int(values['slider_y'])
+    #if event == sg.WIN_CLOSED or event == 'Exit':  
+    if event in (sg.WIN_CLOSED, 'Cancel'): 
+        break 
+    
+    fig = matplotlib.figure.Figure(figsize=(15, 8), dpi=100)
+    fig.suptitle(str(angle[x][y]*180/np.pi) + ' ' + str(domain_array[x][y]))
+    a1 = fig.add_subplot(132)
+    a1.matshow(image1)
+    a1.plot(y,x,marker = '+',color = 'r',markersize = 25)
+    a2 = fig.add_subplot(133)
+    a3 = fig.add_subplot(131)
+    cmap = mpl.cm.prism
+    cmap.set_under('black')
+    norm = mpl.colors.Normalize(vmin=0.5, vmax=maxdomain+0.5)
+
+    a3.matshow(domain_array,cmap = cmap,norm = norm)
+    a3.plot(y,x,marker = '+',color = 'r',markersize = 25)
+    ar = (dca.data[x,y,:,:])
+    yy,xx = np.meshgrid(np.arange(ar.shape[1]),np.arange(ar.shape[0]))
+    rr = np.sqrt((xx-x0)**2 + (yy-y0)**2)
+    d = ma.masked_where(rr<=9,ar)
+    a2.matshow(d,cmap = 'gray')
+    p0 = braggpeaks_uncorrected1.get_pointlist(x,y).data
+    a2.scatter(p0['qy'][1:],p0['qx'][1:],color='r',s=size_scale_factor*p0['intensity'][1:]/np.max(p0['intensity']))
+    cir1 = Circle((y0,x0),radius=r_inner, fill=False, edgecolor='r', linestyle="-")
+    cir2 = Circle((y0,x0),radius=r_outer, fill=False, edgecolor='r', linestyle="-")
+    a2.add_patch(cir1)
+    a2.add_patch(cir2)
+    delete_figure_agg(f)
+    f = draw_figure(canvas, fig)
+
+
+window.close()
+
